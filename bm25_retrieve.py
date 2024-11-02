@@ -95,3 +95,11 @@ if __name__ == "__main__":
     # 將答案字典保存為json文件
     with open(args.output_path, 'w', encoding='utf8') as f:
         json.dump(answer_dict, f, ensure_ascii=False, indent=4)  # 儲存檔案，確保格式和非ASCII字符
+
+
+# python bm25_retrieve.py 
+# --question_path "競賽資料集/dataset/preliminary/questions_example.json" 
+# --source_path "競賽資料集/reference" 
+# --output_path "result/baseline.json"
+
+## python bm25_retrieve.py --question_path
