@@ -1,12 +1,15 @@
 import os
 import json
 import argparse
-
+import numpy as np
 from tqdm import tqdm
 import jieba  # 用於中文文本分詞
 import pdfplumber  # 用於從PDF文件中提取文字的工具
 from rank_bm25 import BM25Okapi  # 使用BM25演算法進行文件檢索
 
+import torch
+from sentence_transformers import SentenceTransformer
+from transformers import BertTokenizer, BertModel
 
 # 載入參考資料，返回一個字典，key為檔案名稱，value為PDF檔內容的文本
 def load_data(source_path):
@@ -35,10 +38,9 @@ def read_pdf(pdf_loc, page_infos: list = None):
 
 # 根據查詢語句和指定的來源，檢索答案
 def BM25_retrieve(qs, source, corpus_dict):
-    filtered_corpus = [corpus_dict[int(file)] for file in source]
+    filtered_corpus = [corpus_dict[int(file)] for file in source] # e.g. ['hello world', 'hello python',...]
 
     # [TODO] 可自行替換其他檢索方式，以提升效能
-
     tokenized_corpus = [list(jieba.cut_for_search(doc)) for doc in filtered_corpus]  # 將每篇文檔進行分詞
     bm25 = BM25Okapi(tokenized_corpus)  # 使用BM25演算法建立檢索模型
     tokenized_query = list(jieba.cut_for_search(qs))  # 將查詢語句進行分詞
@@ -46,7 +48,59 @@ def BM25_retrieve(qs, source, corpus_dict):
     a = ans[0]
     # 找回與最佳匹配文本相對應的檔案名
     res = [key for key, value in corpus_dict.items() if value == a]
+
     return res[0]  # 回傳檔案名
+
+
+def Bge_retrieve(qs, source, corpus_dict):
+    # 將文檔內容列出來以文字形式
+    filtered_corpus = [corpus_dict[int(file)] for file in source]
+    
+    #將文字內容轉為向量 embeddings
+    model = SentenceTransformer('BAAI/bge-m3')
+    corpus_embeddings = model.encode(filtered_corpus)
+    query_embedding = model.encode(qs)
+
+    #計算相似度
+    similarities = model.similarity(query_embedding, corpus_embeddings)
+    max_sim_index = similarities.argmax().item()
+
+    return source[max_sim_index]
+
+
+
+def BERT_retrieve(qs, source, corpus_dict):
+    # 將文檔內容列出來以文字形式
+    filtered_corpus = [corpus_dict[int(file)] for file in source]
+    
+    #將文字內容轉為向量 embeddings
+    tokenizer = BertTokenizer.from_pretrained('bert-base-chinese')
+    model = BertModel.from_pretrained('ckiplab/bert-base-chinese')
+    def get_embedding(text):
+        inputs = tokenizer(text, return_tensors='pt', padding=True, truncation=True)
+        outputs = model(**inputs)
+        return outputs.last_hidden_state[:, 0, :].detach()
+    
+    corpus_embeddings = [get_embedding(doc) for doc in filtered_corpus]
+    query_embedding = get_embedding(qs)
+
+    def cosine_similarity(vec1, vec2):
+        vec1 = vec1.numpy()
+        vec2 = vec2.numpy()
+        dot_product = np.dot(vec1, vec2.T)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot_product / (norm1 * norm2)
+    
+    #計算相似度
+    similarities = [cosine_similarity(query_embedding, emb) for emb in corpus_embeddings]
+    max_sim_index = np.argmax(similarities)
+
+    return source[max_sim_index]
+
 
 
 if __name__ == "__main__":
@@ -76,17 +130,17 @@ if __name__ == "__main__":
     for q_dict in qs_ref['questions']:
         if q_dict['category'] == 'finance':
             # 進行檢索
-            retrieved = BM25_retrieve(q_dict['query'], q_dict['source'], corpus_dict_finance)
+            retrieved = BERT_retrieve(q_dict['query'], q_dict['source'], corpus_dict_finance)
             # 將結果加入字典
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         elif q_dict['category'] == 'insurance':
-            retrieved = BM25_retrieve(q_dict['query'], q_dict['source'], corpus_dict_insurance)
+            retrieved = BERT_retrieve(q_dict['query'], q_dict['source'], corpus_dict_insurance)
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         elif q_dict['category'] == 'faq':
             corpus_dict_faq = {key: str(value) for key, value in key_to_source_dict.items() if key in q_dict['source']}
-            retrieved = BM25_retrieve(q_dict['query'], q_dict['source'], corpus_dict_faq)
+            retrieved = BERT_retrieve(q_dict['query'], q_dict['source'], corpus_dict_faq)
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         else:
@@ -95,11 +149,3 @@ if __name__ == "__main__":
     # 將答案字典保存為json文件
     with open(args.output_path, 'w', encoding='utf8') as f:
         json.dump(answer_dict, f, ensure_ascii=False, indent=4)  # 儲存檔案，確保格式和非ASCII字符
-
-
-# python bm25_retrieve.py 
-# --question_path "競賽資料集/dataset/preliminary/questions_example.json" 
-# --source_path "競賽資料集/reference" 
-# --output_path "result/baseline.json"
-
-## python bm25_retrieve.py --question_path
