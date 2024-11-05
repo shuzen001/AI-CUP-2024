@@ -21,17 +21,13 @@ python eval.py --ground_truth_path "競賽資料集/dataset/preliminary/ground_t
 python analysis.py --ground_truth_path "競賽資料集/dataset/preliminary/ground_truths_example.json" --output_path "result/XXXXXX.json"
 ```
 
+### 模型性能比較
 
-## BＭ25 Precision@1 : 0.7133 (Baseline)
-背後原理還是TF-IDF，所以沒有想繼續弄，比較想直接使用dense vector的作法
-
-## BAAI/bge-m3 Precision@1 : 0.7733
-用一個BAAI/bge-m3 這個embedding 模型，根據similarity找出最佳文檔編號
-bge-m3 的 sequence length : 8192 token
-
-
-## BERT Precision@1 : 0.4000
-用bert-base-chinese結果
+| 模型名稱                     | Precision@1 | 描述                                                                                           |
+|------------------------------|-------------|------------------------------------------------------------------------------------------------|
+| **BM25**                     | 0.7133      | 基於 TF-IDF 原理的經典檢索模型，作為基線（Baseline）模型。由於其基礎原理，我們暫未深入優化此模型，轉而探索更先進的 dense vector 方法。 |
+| **BAAI/bge-m3**              | 0.7733      | 使用 BAAI/bge-m3 嵌入模型，根據相似度找出最佳文檔編號。bge-m3 的序列長度為 8192 tokens，能更好地處理長文本。試過加入Prompt效果都沒有比較好。                        |
+| **BERT (bert-base-chinese)** | 0.4000      | 使用 bert-base-chinese 模型進行預測，表現不如 BM25 和 bge-m3，主要原因可能是 BERT 的上下文窗口限制。                            |
 
 
 ## 待辦
