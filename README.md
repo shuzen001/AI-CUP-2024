@@ -1,8 +1,8 @@
 # 初賽 : 找出最符合問題的文檔編號
 
-## 格式
-input: questions.json
-submit: pred.json 
+## 格式說明
+
+- **提交文件**: `pred.json`
 
 
 ## 預測結果 命令
