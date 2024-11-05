@@ -6,16 +6,19 @@ from tqdm import tqdm
 import jieba  # 用於中文文本分詞
 import pdfplumber  # 用於從PDF文件中提取文字的工具
 from rank_bm25 import BM25Okapi  # 使用BM25演算法進行文件檢索
-
+from collections import defaultdict
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import BertTokenizer, BertModel
 
 # 載入參考資料，返回一個字典，key為檔案名稱，value為PDF檔內容的文本
-def load_data(source_path):
-    masked_file_ls = os.listdir(source_path)  # 獲取資料夾中的檔案列表
-    corpus_dict = {int(file.replace('.pdf', '')): read_pdf(os.path.join(source_path, file)) for file in tqdm(masked_file_ls)}  # 讀取每個PDF文件的文本，並以檔案名作為鍵，文本內容作為值存入字典
-    return corpus_dict
+# def load_data(source_path):
+#     '''
+#     不使用了，浪費時間
+#     '''
+#     masked_file_ls = os.listdir(source_path)  # 獲取資料夾中的檔案列表
+#     corpus_dict = {int(file.replace('.pdf', '')): read_pdf(os.path.join(source_path, file)) for file in tqdm(masked_file_ls)}  # 讀取每個PDF文件的文本，並以檔案名作為鍵，文本內容作為值存入字典
+#     return corpus_dict
 
 
 # 讀取單個PDF文件並返回其文本內容
@@ -51,15 +54,30 @@ def BM25_retrieve(qs, source, corpus_dict):
 
     return res[0]  # 回傳檔案名
 
-
 def Bge_retrieve(qs, source, corpus_dict):
+    # 將文檔內容列出來以文字形式
+    filtered_corpus = [corpus_dict[int(file)] for file in source]
+    #將文字內容轉為向量 embeddings
+    model = SentenceTransformer('BAAI/bge-m3', device='cuda') # 使用BGE模型 m3 AP 0.77
+    corpus_embeddings = model.encode(filtered_corpus, convert_to_tensor=True, device='cuda' )
+    query_embedding = model.encode(qs,prompt="為這個句子生成表示，用以檢索相似的文章: " ,convert_to_tensor=True, device='cuda')
+
+    # 計算相似度
+    similarities = torch.nn.functional.cosine_similarity(query_embedding, corpus_embeddings)
+    max_sim_index = similarities.argmax().item()
+    
+    return source[max_sim_index]
+
+def jina_retrieve(qs, source, corpus_dict):
     # 將文檔內容列出來以文字形式
     filtered_corpus = [corpus_dict[int(file)] for file in source]
     
     #將文字內容轉為向量 embeddings
-    model = SentenceTransformer('BAAI/bge-m3')
-    corpus_embeddings = model.encode(filtered_corpus)
-    query_embedding = model.encode(qs)
+    # q_instruction = "為這個句子生成表示，用以檢索相似的文章"
+    # d_instruction = "為這個文檔生成表示，用以被檢索"
+    model = SentenceTransformer('jinaai/jina-embeddings-v3', trust_remote_code=True ,device='cuda') # 使用BGE模型 m3 AP 0.77
+    corpus_embeddings = model.encode(filtered_corpus, task="retrieval.passage")
+    query_embedding = model.encode(qs, task="retrieval.query", prompt_name="retrieval.query" )[0]
 
     #計算相似度
     similarities = model.similarity(query_embedding, corpus_embeddings)
@@ -68,8 +86,13 @@ def Bge_retrieve(qs, source, corpus_dict):
     return source[max_sim_index]
 
 
-
 def BERT_retrieve(qs, source, corpus_dict):
+    '''
+    由於Bert的上下文token限制只有512，因此還需要進行分段處理
+    待辦事項：
+        1. 處理長文本限制
+    '''
+
     # 將文檔內容列出來以文字形式
     filtered_corpus = [corpus_dict[int(file)] for file in source]
     
@@ -103,6 +126,35 @@ def BERT_retrieve(qs, source, corpus_dict):
 
 
 
+def load_category_corpus(source_path, source_ids):
+    """
+    只讀取指定 source_ids 中的文件，以減少不必要的讀取。
+    :param source_path: 資料夾路徑
+    :param source_ids: 要讀取的文件 id 列表
+    :return: 該類別對應的 corpus 字典
+    """
+    corpus_dict = {}
+    for file in tqdm(os.listdir(source_path)):
+        file_id = int(file.replace('.pdf', ''))
+        if file_id in source_ids:  # 僅載入在 source_ids 中的文件
+            file_path = os.path.join(source_path, file)
+            corpus_dict[file_id] = read_pdf(file_path)
+    return corpus_dict
+
+def get_unique_source_ids(qs_ref, category):
+    """
+    根據指定的 category，獲取所有 unique source ids。
+    :param qs_ref: 問題的 JSON 資料
+    :param category: 類別名稱 (如 'insurance', 'finance')
+    :return: 該類別下的 unique source ids 集合
+    """
+    source_ids = set()
+    for question in qs_ref["questions"]:
+        if question["category"] == category:
+            source_ids.update(question["source"])
+    return sorted(source_ids)
+
+
 if __name__ == "__main__":
     # 使用argparse解析命令列參數
     parser = argparse.ArgumentParser(description='Process some paths and files.')
@@ -117,11 +169,16 @@ if __name__ == "__main__":
     with open(args.question_path, 'rb') as f:
         qs_ref = json.load(f)  # 讀取問題檔案
 
+
+    # 已經改成較有效率的方式讀取資料，原本光載入資料大概就要五分鐘
     source_path_insurance = os.path.join(args.source_path, 'insurance')  # 設定參考資料路徑
-    corpus_dict_insurance = load_data(source_path_insurance)
+    insurance_source_ids = get_unique_source_ids(qs_ref, 'insurance')
+    corpus_dict_insurance = load_category_corpus(source_path_insurance, insurance_source_ids)
 
     source_path_finance = os.path.join(args.source_path, 'finance')  # 設定參考資料路徑
-    corpus_dict_finance = load_data(source_path_finance)
+    finance_source_ids = get_unique_source_ids(qs_ref, 'finance')
+    corpus_dict_finance = load_category_corpus(source_path_finance, finance_source_ids)
+
 
     with open(os.path.join(args.source_path, 'faq/pid_map_content.json'), 'rb') as f_s:
         key_to_source_dict = json.load(f_s)  # 讀取參考資料文件
@@ -130,17 +187,17 @@ if __name__ == "__main__":
     for q_dict in qs_ref['questions']:
         if q_dict['category'] == 'finance':
             # 進行檢索
-            retrieved = BERT_retrieve(q_dict['query'], q_dict['source'], corpus_dict_finance)
+            retrieved = Bge_retrieve(q_dict['query'], q_dict['source'], corpus_dict_finance)
             # 將結果加入字典
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         elif q_dict['category'] == 'insurance':
-            retrieved = BERT_retrieve(q_dict['query'], q_dict['source'], corpus_dict_insurance)
+            retrieved = Bge_retrieve(q_dict['query'], q_dict['source'], corpus_dict_insurance)
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         elif q_dict['category'] == 'faq':
             corpus_dict_faq = {key: str(value) for key, value in key_to_source_dict.items() if key in q_dict['source']}
-            retrieved = BERT_retrieve(q_dict['query'], q_dict['source'], corpus_dict_faq)
+            retrieved = Bge_retrieve(q_dict['query'], q_dict['source'], corpus_dict_faq)
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         else:
