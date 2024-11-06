@@ -10,6 +10,8 @@ from collections import defaultdict
 import torch
 from sentence_transformers import SentenceTransformer
 from transformers import BertTokenizer, BertModel
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 # 載入參考資料，返回一個字典，key為檔案名稱，value為PDF檔內容的文本
 # def load_data(source_path):
@@ -41,6 +43,7 @@ def read_pdf(pdf_loc, page_infos: list = None):
 
 # 根據查詢語句和指定的來源，檢索答案
 def BM25_retrieve(qs, source, corpus_dict):
+    
     filtered_corpus = [corpus_dict[int(file)] for file in source] # e.g. ['hello world', 'hello python',...]
 
     # [TODO] 可自行替換其他檢索方式，以提升效能
@@ -55,6 +58,12 @@ def BM25_retrieve(qs, source, corpus_dict):
     return res[0]  # 回傳檔案名
 
 def Bge_retrieve(qs, source, corpus_dict):
+
+    '''
+    BGE模型檢索，使用BGE模型進行檢索，並返回最相似的文章
+
+    '''
+
     # 將文檔內容列出來以文字形式
     filtered_corpus = [corpus_dict[int(file)] for file in source]
     #將文字內容轉為向量 embeddings
@@ -67,6 +76,41 @@ def Bge_retrieve(qs, source, corpus_dict):
     max_sim_index = similarities.argmax().item()
     
     return source[max_sim_index]
+
+def Bge_retrieve_with_rerank(qs, source, corpus_dict, top_k=2):
+
+    '''
+    目前最屌的檢索方法，先用BGE模型找出top_k個最相似的文章，再用rerank模型進行排序
+
+    '''
+
+    # 初步檢索
+    filtered_corpus = [corpus_dict[int(file)] for file in source]
+    embed_model = SentenceTransformer('BAAI/bge-m3', device='cuda')
+    corpus_embeddings = embed_model.encode(filtered_corpus, convert_to_tensor=True, device='cuda')
+    query_embedding = embed_model.encode(qs, prompt="為這個句子生成表示，用以檢索相似的文章: ", convert_to_tensor=True, device='cuda')
+    similarities = torch.nn.functional.cosine_similarity(query_embedding, corpus_embeddings)
+    
+    top_k_indices = similarities.topk(top_k).indices.tolist()
+    top_k_sources = [source[idx] for idx in top_k_indices] # 文件編號
+    top_k_texts = [filtered_corpus[idx] for idx in top_k_indices]
+
+    # 進行rerank
+    tokenizer = AutoTokenizer.from_pretrained('BAAI/bge-reranker-large')
+    model = AutoModelForSequenceClassification.from_pretrained('BAAI/bge-reranker-large')
+    model.eval()
+
+    qs_n_txt = [[qs, text] for text in top_k_texts]
+    with torch.no_grad():
+        inputs = tokenizer(qs_n_txt, padding=True, truncation=True, return_tensors='pt')
+        scores = model(**inputs, return_dict=True).logits.view(-1, ).float()
+    reranked_indices = scores.argsort(descending=True).tolist()
+    best_source = top_k_sources[reranked_indices[0]]
+
+    return best_source
+
+
+
 
 def jina_retrieve(qs, source, corpus_dict):
     # 將文檔內容列出來以文字形式
@@ -187,12 +231,12 @@ if __name__ == "__main__":
     for q_dict in qs_ref['questions']:
         if q_dict['category'] == 'finance':
             # 進行檢索
-            retrieved = Bge_retrieve(q_dict['query'], q_dict['source'], corpus_dict_finance)
+            retrieved = Bge_retrieve_with_rerank(q_dict['query'], q_dict['source'], corpus_dict_finance)
             # 將結果加入字典
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         elif q_dict['category'] == 'insurance':
-            retrieved = Bge_retrieve(q_dict['query'], q_dict['source'], corpus_dict_insurance)
+            retrieved = BM25_retrieve(q_dict['query'], q_dict['source'], corpus_dict_insurance)
             answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
 
         elif q_dict['category'] == 'faq':
