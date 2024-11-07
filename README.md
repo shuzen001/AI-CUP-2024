@@ -35,4 +35,6 @@ python analysis.py --ground_truth_path "競賽資料集/dataset/preliminary/grou
 - 用將pdf內容做分段，以方便檢索，否則模型的context size 不夠大，檢索準確度就會下降，就像是bert一樣
 - 可以嘗試使用多模態的模型去分析pdf，OCR之類的方法
 - 可以嘗試fine-tune model
+- 可以嘗試做batch，使embedding 過程更快
+- 可以嘗試做chunk
 -
