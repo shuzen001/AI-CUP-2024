@@ -14,6 +14,7 @@ import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from langchain.text_splitter import CharacterTextSplitter
 import gc
+from FlagEmbedding import FlagReranker
 
 def jina_retrieve(qs, source, corpus_dict):
     # 將文檔內容列出來以文字形式
@@ -157,15 +158,15 @@ class BGERetriever(Retriever):
     
 # BGE Rerank檢索器
 class BGERetrieverWithRerank(Retriever):
-    def __init__(self, embed_model='BAAI/bge-m3', rerank_model='BAAI/bge-reranker-v2-m3', device='cuda'):
+    def __init__(self, embed_model='BAAI/bge-m3', rerank_model='BAAI/bge-reranker-large', device='cuda'):
         self.embed_model = SentenceTransformer(embed_model, device=device)
         self.rerank_tokenizer = AutoTokenizer.from_pretrained(rerank_model)
-        self.rerank_model = AutoModelForSequenceClassification.from_pretrained(rerank_model)
-        self.rerank_model.eval()
+        self.rerank_model = FlagReranker(rerank_model, device=device)
+        # self.rerank_model.eval()
 
-    def retrieve(self, query, source, corpus_dict, top_k=3):
+    def retrieve(self, query, source, corpus_dict, top_k=2):
         '''
-        BGE模型檢索，使用BGE模型進行檢索，並返回最相似的前三篇文章
+        BGE模型檢索，使用BGE模型進行檢索，並返回最相似的前兩篇文章
         優化後逐個處理文檔以節省記憶體
         '''
         top_k_similar = []  # 存儲(top_k)相似度和對應的文件ID的列表
@@ -173,7 +174,7 @@ class BGERetrieverWithRerank(Retriever):
         # 對查詢進行編碼
         query_embedding = self.embed_model.encode(
             query,
-            prompt="為這個句子生成表示，用以檢索相似的文章: ",
+            prompt="為這個句子生成表示，用以檢索相似的文章",
             convert_to_tensor=True
         )
         
@@ -188,7 +189,7 @@ class BGERetrieverWithRerank(Retriever):
             # 將單個文檔轉為嵌入
             document_embedding = self.embed_model.encode(document, convert_to_tensor=True)
             
-            # 計算相似度，設置 dim=0 以適應1維張量
+            # 計算相似度，設置 dim=0 以適應1維張量，因為一次只轉一個文檔的嵌入
             similarity = torch.nn.functional.cosine_similarity(query_embedding, document_embedding, dim=0).item()
             
             # 插入到top_k_similar列表中，保持列表按相似度降序排列，最多保留top_k個元素
@@ -200,25 +201,29 @@ class BGERetrieverWithRerank(Retriever):
                 if similarity > top_k_similar[-1][0]:
                     top_k_similar[-1] = (similarity, file_id)
                     top_k_similar.sort(key=lambda x: x[0], reverse=True)
+
         
         # 提取Top-K的文件ID和文本
         top_k_sources = [file_id for _, file_id in top_k_similar]
         top_k_texts = [corpus_dict[int(file_id)] for file_id in top_k_sources]
         
-        # 進行rerank
-        qs_n_txt = [[query, text] for text in top_k_texts]
         with torch.no_grad():
-            inputs = self.rerank_tokenizer(qs_n_txt, padding=True, truncation=True, return_tensors='pt')
-            scores = self.rerank_model(**inputs, return_dict=True).logits.view(-1).float()
-        
-        # 獲取rerank後的排序
-        reranked_indices = scores.argsort(descending=True).tolist()
-        
-        # 選擇rerank後得分最高的文檔
-        best_source = top_k_sources[reranked_indices[0]]
-        
-        return best_source
-    
+            pairs = [[query, text] for text in top_k_texts]
+            inputs = self.rerank_tokenizer(
+                pairs,
+                padding=True,
+                truncation=True,
+                return_tensors='pt'
+            ).to('cuda')
+            
+            rerank_scores = self.rerank_model(**inputs).logits.view(-1,).float()
+            
+            # Get the single best document
+            best_idx = rerank_scores.argmax().item()
+            best_source = top_k_sources[best_idx]
+            return best_source
+
+
     # def colbert_retrieve(self, query, source, corpus_dict):
     #     '''
     #     使用ColBERT模型進行檢索
@@ -405,7 +410,7 @@ class RetrieverPipeline:
         self.pdf_reader = PDFReader()
         self.retrievers = {
             'finance': BGERetrieverWithRerank(),
-            'insurance': BM25Retriever(),
+            'insurance': BGERetrieverWithRerank(),
             'faq': BGERetrieverWithRerank()
         }
     
