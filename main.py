@@ -14,7 +14,14 @@ import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from langchain.text_splitter import CharacterTextSplitter
 import gc
-from FlagEmbedding import FlagReranker
+import faiss
+import asyncio
+import torch.quantization
+from typing import Dict, List, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+# from FlagEmbedding import FlagModel 
 
 def jina_retrieve(qs, source, corpus_dict):
     # 將文檔內容列出來以文字形式
@@ -117,6 +124,100 @@ class BM25Retriever(Retriever):
         res = [key for key, value in corpus_dict.items() if value == a]
 
         return res[0]  # 回傳檔案名
+    
+
+class HybridRAGRetriever(Retriever):
+    def __init__(self, embed_model='BAAI/bge-m3', device='cuda'):
+        self.device = torch.device(device)
+        self.embed_model = SentenceTransformer(embed_model, device=device)
+        self.text_splitter = CharacterTextSplitter(
+            chunk_size=150,
+            chunk_overlap=50,
+            separator="。"  # 加入更多中文標點符號
+        )
+
+    def _get_bm25_scores(self, query, source, corpus_dict):
+        """使用 BM25 進行檢索並返回分數"""
+        filtered_corpus = [corpus_dict[int(file)] for file in source]
+        tokenized_corpus = [list(jieba.cut_for_search(doc)) for doc in filtered_corpus]
+        bm25 = BM25Okapi(tokenized_corpus)
+        tokenized_query = list(jieba.cut_for_search(query))
+        
+        # 獲取所有文檔的 BM25 分數
+        doc_scores = bm25.get_scores(tokenized_query)
+        
+        # 將分數與文檔 ID 配對
+        return [(score, src) for score, src in zip(doc_scores, source)]
+
+    def _get_embedding_scores(self, query, source, corpus_dict):
+        """使用 embedding 相似度進行檢索並返回分數"""
+        query_embedding = self.embed_model.encode(
+            query,
+            prompt="為這個句子生成表示，用以檢索相似的文章: ",
+            convert_to_tensor=True
+        )
+        
+        scores = []
+        for file_id in source:
+            document = corpus_dict[int(file_id)]
+            # 將文檔分成小塊
+            chunks = self.text_splitter.split_text(document)
+            chunk_scores = []
+            
+            for chunk in chunks:
+                doc_embedding = self.embed_model.encode(chunk, convert_to_tensor=True)
+                similarity = torch.nn.functional.cosine_similarity(
+                    query_embedding.unsqueeze(0),
+                    doc_embedding.unsqueeze(0)
+                ).item()
+                chunk_scores.append(similarity)
+            
+            # 使用最高的塊分數作為文檔分數
+            max_score = max(chunk_scores) if chunk_scores else 0
+            scores.append((max_score, file_id))
+        
+        return scores
+
+    def retrieve(self, query, source, corpus_dict):
+        """結合 BM25 和 embedding 的混合檢索"""
+        # 獲取 BM25 分數
+        bm25_scores = self._get_bm25_scores(query, source, corpus_dict)
+        
+        # 獲取 embedding 相似度分數
+        embedding_scores = self._get_embedding_scores(query, source, corpus_dict)
+        
+        # 正規化分數
+        def normalize_scores(scores):
+            if not scores:
+                return []
+            min_score = min(score for score, _ in scores)
+            max_score = max(score for score, _ in scores)
+            if max_score == min_score:
+                return [(1.0, doc_id) for _, doc_id in scores]
+            return [((score - min_score) / (max_score - min_score), doc_id) 
+                   for score, doc_id in scores]
+        
+        bm25_scores_norm = normalize_scores(bm25_scores)
+        embedding_scores_norm = normalize_scores(embedding_scores)
+        
+        # 將分數存入字典以便合併
+        combined_scores = defaultdict(float)
+        
+        # 設定權重
+        bm25_weight = 0.3
+        embedding_weight = 0.7
+        
+        # 合併分數
+        for score, doc_id in bm25_scores_norm:
+            combined_scores[doc_id] += score * bm25_weight
+        
+        for score, doc_id in embedding_scores_norm:
+            combined_scores[doc_id] += score * embedding_weight
+        
+        # 找出最高分數的文檔
+        best_doc_id = max(combined_scores.items(), key=lambda x: x[1])[0]
+        
+        return best_doc_id
 
 # BGE檢索器
 class BGERetriever(Retriever):
@@ -161,8 +262,8 @@ class BGERetrieverWithRerank(Retriever):
     def __init__(self, embed_model='BAAI/bge-m3', rerank_model='BAAI/bge-reranker-large', device='cuda'):
         self.embed_model = SentenceTransformer(embed_model, device=device)
         self.rerank_tokenizer = AutoTokenizer.from_pretrained(rerank_model)
-        self.rerank_model = FlagReranker(rerank_model, device=device)
-        # self.rerank_model.eval()
+        self.rerank_model = AutoModelForSequenceClassification.from_pretrained(rerank_model)
+        self.rerank_model.to(device)
 
     def retrieve(self, query, source, corpus_dict, top_k=2):
         '''
@@ -231,175 +332,6 @@ class BGERetrieverWithRerank(Retriever):
     #     '''
     #     filtered_corpus_query_pair = [corpus_dict[int(file)] for file in source]
 
-class BGERetrieverWithRerank_ver2(Retriever):
-    def __init__(
-        self, 
-        embed_model='BAAI/bge-m3', 
-        rerank_model='BAAI/bge-reranker-v2-m3', 
-        device='cuda',
-        chunk_size=500,
-        chunk_overlap=50
-    ):
-        self.device = torch.device(device)
-        self.embed_model = SentenceTransformer(embed_model, device=device)
-        self.rerank_tokenizer = AutoTokenizer.from_pretrained(rerank_model)
-        self.rerank_model = AutoModelForSequenceClassification.from_pretrained(rerank_model)
-        self.rerank_model.to(device)
-        self.rerank_model.eval()
-        self.text_splitter = CharacterTextSplitter(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-            separator="\n"
-        )
-
-    def _clear_memory(self):
-        """Helper function to clear memory"""
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    def _process_document(self, query_embedding, document, file_id):
-        """Process a single document and return top similarities for its chunks"""
-        chunks = self.text_splitter.split_text(document)
-        chunk_scores = []
-        
-        for chunk in chunks:
-            with torch.no_grad():
-                chunk_embedding = self.embed_model.encode(
-                    chunk,
-                    convert_to_tensor=True,
-                    show_progress_bar=False
-                )
-                
-                similarity = torch.nn.functional.cosine_similarity(
-                    query_embedding.unsqueeze(0),
-                    chunk_embedding.unsqueeze(0)
-                )
-                
-                chunk_scores.append((similarity.item(), chunk, file_id))
-                
-                del chunk_embedding
-                self._clear_memory()
-        
-        if chunk_scores:
-            return max(chunk_scores, key=lambda x: x[0])
-        return None
-
-    def retrieve(self, query, source, corpus_dict):
-        """Retrieve single best document after reranking"""
-        self._clear_memory()
-        
-        query_embedding = self.embed_model.encode(
-            query,
-            prompt="為這個句子生成表示，用以檢索相似的文章: ",
-            convert_to_tensor=True
-        )
-        
-        document_scores = []
-        for file_id in source:
-            document = corpus_dict[int(file_id)]
-            best_chunk_score = self._process_document(query_embedding, document, file_id)
-            if best_chunk_score:
-                document_scores.append(best_chunk_score)
-        
-        # Get top 2 for reranking
-        document_scores.sort(reverse=True, key=lambda x: x[0])
-        top_documents = document_scores[:2]  # Only get top 2
-        
-        del query_embedding, document_scores
-        self._clear_memory()
-        
-        if not top_documents:
-            return source[0] if source else None
-        
-        # If only one document, return it
-        if len(top_documents) == 1:
-            return top_documents[0][2]
-        
-        # Rerank top 2
-        texts = [doc[1] for doc in top_documents]
-        sources = [doc[2] for doc in top_documents]
-        
-        with torch.no_grad():
-            pairs = [[query, text] for text in texts]
-            inputs = self.rerank_tokenizer(
-                pairs,
-                padding=True,
-                truncation=True,
-                return_tensors='pt'
-            ).to(self.device)
-            
-            rerank_scores = self.rerank_model(**inputs).logits.view(-1,).float()
-            
-            # Get the single best document
-            best_idx = rerank_scores.argmax().item()
-            best_source = sources[best_idx]
-            
-            del inputs, rerank_scores
-            self._clear_memory()
-            
-            return best_source
-
-    def retrieve_with_scores(self, query, source, corpus_dict):
-        """Debug version that returns scores for the top 2 documents"""
-        self._clear_memory()
-        
-        query_embedding = self.embed_model.encode(
-            query,
-            prompt="為這個句子生成表示，用以檢索相似的文章: ",
-            convert_to_tensor=True
-        )
-        
-        document_scores = []
-        for file_id in source:
-            document = corpus_dict[int(file_id)]
-            best_chunk_score = self._process_document(query_embedding, document, file_id)
-            if best_chunk_score:
-                document_scores.append(best_chunk_score)
-                print(f"Processed document {file_id}, similarity: {best_chunk_score[0]:.4f}")
-        
-        document_scores.sort(reverse=True, key=lambda x: x[0])
-        top_documents = document_scores[:2]
-        
-        del query_embedding, document_scores
-        self._clear_memory()
-        
-        if not top_documents:
-            return [{'source': source[0], 'initial_score': 0, 'rerank_score': 0}] if source else []
-        
-        texts = [doc[1] for doc in top_documents]
-        sources = [doc[2] for doc in top_documents]
-        initial_scores = [doc[0] for doc in top_documents]
-        
-        with torch.no_grad():
-            pairs = [[query, text] for text in texts]
-            inputs = self.rerank_tokenizer(
-                pairs,
-                padding=True,
-                truncation=True,
-                return_tensors='pt'
-            ).to(self.device)
-            
-            rerank_scores = self.rerank_model(**inputs).logits.view(-1,).float()
-            
-            final_results = []
-            for idx, (source, text, initial_score, rerank_score) in enumerate(zip(
-                sources, texts, initial_scores, rerank_scores
-            )):
-                final_results.append({
-                    'source': source,
-                    'text': text[:200] + '...',
-                    'initial_score': initial_score,
-                    'rerank_score': rerank_score.item()
-                })
-            
-            final_results.sort(key=lambda x: x['rerank_score'], reverse=True)
-            
-            del inputs, rerank_scores, texts, sources
-            self._clear_memory()
-            
-            return final_results
-
 # 主要流程類別
 class RetrieverPipeline:
     def __init__(self, question_path, source_path, output_path):
@@ -409,9 +341,9 @@ class RetrieverPipeline:
         self.answer_dict = {"answers": []}
         self.pdf_reader = PDFReader()
         self.retrievers = {
-            'finance': BGERetrieverWithRerank(),
-            'insurance': BGERetrieverWithRerank(),
-            'faq': BGERetrieverWithRerank()
+            'finance': HybridRAGRetriever(),
+            'insurance': HybridRAGRetriever(),
+            'faq': HybridRAGRetriever()
         }
     
     def load_questions(self):
