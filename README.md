@@ -5,21 +5,15 @@
 - **提交文件**: `pred.json`
 
 
-## 預測結果 命令
+## 預測結果與評估 命令
 ```shell
+# 僅生成預測結果
 python main.py --question_path "競賽資料集/dataset/preliminary/questions_example.json" --source_path "競賽資料集/reference" --output_path "result/bge.json"
+
+# 生成預測結果並同時評估
+python main.py --question_path "競賽資料集/dataset/preliminary/questions_example.json" --source_path "競賽資料集/reference" --output_path "result/bge.json" --ground_truth_path "競賽資料集/dataset/preliminary/ground_truths_example.json"
 ```
 
-## 評估結果 命令
-```shell
-python eval.py --ground_truth_path "競賽資料集/dataset/preliminary/ground_truths_example.json" --output_path "result/XXXXXX.json"
-```
-
-
-## 分析類別準確率 命令
-```shell
-python analysis.py --ground_truth_path "競賽資料集/dataset/preliminary/ground_truths_example.json" --output_path "result/XXXXXX.json"
-```
 
 ### 模型性能比較
 
@@ -29,6 +23,8 @@ python analysis.py --ground_truth_path "競賽資料集/dataset/preliminary/grou
 | **BAAI/bge-m3**              | 0.7733      | 0.6800    | 0.6800    | 0.9600    | bge-m3 嵌入模型，根據相似度找出最佳文檔編號。bge-m3 的序列長度為 8192 tokens，能更好地處理長文本。試過加入 Prompt 效果都沒有比較好。                        |
 | **BERT (bert-base-chinese)** | 0.4000      | 0.4400    | 0.1400    | 0.1800    | Bert-base-chinese 模型進行預測，表現不如 BM25 和 bge-m3，推測原因為 BERT 的上下文窗口限制。                            |
 | **BAAI/bge-m3 with Reranker + BM25** | **0.8467**      | 0.8000    | 0.7800    | 0.9600    | bge-m3搭配reranker在金融方面的表現不錯，在保險的方面採用BM25，這樣hybrid的方式大幅度增加了precision。                            |
+| **HybridRAGRetriever-E5**             | 0.8067      | 0.9200    | 0.5600    | 0.9400    | 在保險和常見問題類別表現優異，但金融類別仍有改進空間。                            |
+| **Hybrid Retrieval - BGE/M3**         | **0.8667**  | 0.9000    | 0.7400    | 0.9600    | 結合多種檢索策略的方法，在所有類別都達到了不錯的平衡，特別是在金融類別有明顯提升。                            |
 
 
 ## 待辦

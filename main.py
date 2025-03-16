@@ -12,6 +12,7 @@ from sentence_transformers import SentenceTransformer
 from transformers import BertTokenizer, BertModel
 import torch
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM
 from langchain.text_splitter import CharacterTextSplitter
 import gc
 import faiss
@@ -22,6 +23,69 @@ from dataclasses import dataclass
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 # from FlagEmbedding import FlagModel 
+
+# 評估相關函數
+def load_json(file_path):
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    return data
+
+def evaluate_average_precision_at_1(ground_truth, predictions):
+    total = 0
+    cumulative_precision = 0
+
+    # 建立字典來加速ground_truth的查找
+    ground_truth_dict = {item["qid"]: item["retrieve"] for item in ground_truth["ground_truths"]}
+
+    for pred in predictions["answers"]:
+        qid = pred["qid"]
+        predicted_retrieve = pred["retrieve"]
+        
+        # 如果 qid 存在於 ground_truth 且 retrieve 值相同，則計為正確
+        if qid in ground_truth_dict and ground_truth_dict[qid] == predicted_retrieve:
+            cumulative_precision += 1
+        total += 1
+
+    # 計算 Average Precision@1
+    average_precision_at_1 = cumulative_precision / total if total > 0 else 0
+    return average_precision_at_1
+
+def calculate_category_wise_ap(ground_truth, predictions):
+    # 按 category 分組 ground_truth 和 predictions
+    ground_truth_by_category = defaultdict(list)
+    predictions_by_category = defaultdict(list)
+    
+    for item in ground_truth["ground_truths"]:
+        category = item["category"]
+        ground_truth_by_category[category].append(item)
+    
+    for item in predictions["answers"]:
+        # 假設每個 category 都有對應的 ground_truth，如果沒有則跳過
+        if item["qid"] in {g["qid"] for g in ground_truth["ground_truths"]}:
+            for category, gt_list in ground_truth_by_category.items():
+                if any(g["qid"] == item["qid"] for g in gt_list):
+                    predictions_by_category[category].append(item)
+                    break
+
+    # 計算每個 category 的 AP
+    category_ap = {}
+    for category, gt_list in ground_truth_by_category.items():
+        correct = 0
+        total = 0
+        for gt in gt_list:
+            qid = gt["qid"]
+            gt_retrieve = gt["retrieve"]
+            
+            # 找到對應的預測
+            pred = next((p for p in predictions_by_category[category] if p["qid"] == qid), None)
+            if pred and pred["retrieve"] == gt_retrieve:
+                correct += 1
+            total += 1
+
+        # 計算該 category 的 AP
+        category_ap[category] = correct / total if total > 0 else 0
+
+    return category_ap
 
 def jina_retrieve(qs, source, corpus_dict):
     # 將文檔內容列出來以文字形式
@@ -127,11 +191,11 @@ class BM25Retriever(Retriever):
     
 
 class HybridRAGRetriever(Retriever):
-    def __init__(self, embed_model='BAAI/bge-m3', device='cuda'):
+    def __init__(self, embed_model='altaidevorg/bge-m3-distill-8l', device='cuda'):
         self.device = torch.device(device)
         self.embed_model = SentenceTransformer(embed_model, device=device)
         self.text_splitter = CharacterTextSplitter(
-            chunk_size=150,
+            chunk_size=100,
             chunk_overlap=50,
             separator="。"  # 加入更多中文標點符號
         )
@@ -219,6 +283,127 @@ class HybridRAGRetriever(Retriever):
         
         return best_doc_id
 
+
+class HybridRAGRetriever_rerank(HybridRAGRetriever):
+    def __init__(self, 
+                 embed_model='altaidevorg/bge-m3-distill-8l', 
+                 rerank_model='BAAI/bge-reranker-v2-minicpm-layerwise', 
+                 device='cuda'):
+        super().__init__(embed_model=embed_model, device=device)
+        # 使用 layerwise reranker 時，需用 AutoModelForCausalLM 來載入模型
+        self.rerank_tokenizer = AutoTokenizer.from_pretrained(rerank_model, trust_remote_code=True)
+        self.rerank_model = AutoModelForCausalLM.from_pretrained(
+            rerank_model,
+            trust_remote_code=True,
+            torch_dtype=torch.bfloat16 if device == 'cuda' else torch.float32,
+            device_map= 'auto'
+        )
+        self.device = device
+
+    def get_inputs(self, pairs, max_length=2048, prompt=None):
+        """
+        輔助函式：將查詢與段落配對轉換為模型所需的輸入格式。
+        預設 prompt 為：
+        "Given a query A and a passage B, determine whether the passage contains an answer to the query by providing a prediction of either 'Yes' or 'No'."
+        """
+        if prompt is None:
+            prompt = ("Given a query A and a passage B, determine whether the passage contains an answer "
+                      "to the query by providing a prediction of either 'Yes' or 'No'.")
+        sep = "\n"
+        prompt_inputs = self.rerank_tokenizer(prompt, return_tensors=None, add_special_tokens=False)['input_ids']
+        sep_inputs = self.rerank_tokenizer(sep, return_tensors=None, add_special_tokens=False)['input_ids']
+        inputs = []
+        for query, passage in pairs:
+            query_inputs = self.rerank_tokenizer(
+                f'A: {query}',
+                return_tensors=None,
+                add_special_tokens=False,
+                max_length=max_length * 3 // 4,
+                truncation=True
+            )
+            passage_inputs = self.rerank_tokenizer(
+                f'B: {passage}',
+                return_tensors=None,
+                add_special_tokens=False,
+                max_length=max_length,
+                truncation=True
+            )
+            item = self.rerank_tokenizer.prepare_for_model(
+                [self.rerank_tokenizer.bos_token_id] + query_inputs['input_ids'],
+                sep_inputs + passage_inputs['input_ids'],
+                truncation='only_second',
+                max_length=max_length,
+                padding=False,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+                add_special_tokens=False
+            )
+            # 將特殊符號加入後組成完整輸入
+            item['input_ids'] = item['input_ids'] + sep_inputs + prompt_inputs
+            item['attention_mask'] = [1] * len(item['input_ids'])
+            inputs.append(item)
+        return self.rerank_tokenizer.pad(
+            inputs,
+            padding=True,
+            max_length=max_length + len(sep_inputs) + len(prompt_inputs),
+            pad_to_multiple_of=8,
+            return_tensors='pt',
+        )
+
+    def retrieve(self, query, source, corpus_dict):
+        """結合 BM25、embedding 的混合檢索，並加入 reranking"""
+        # 獲取 BM25 分數
+        bm25_scores = self._get_bm25_scores(query, source, corpus_dict)
+        
+        # 獲取 embedding 相似度分數
+        embedding_scores = self._get_embedding_scores(query, source, corpus_dict)
+        
+        # 正規化分數
+        def normalize_scores(scores):
+            if not scores:
+                return []
+            min_score = min(score for score, _ in scores)
+            max_score = max(score for score, _ in scores)
+            if max_score == min_score:
+                return [(1.0, doc_id) for _, doc_id in scores]
+            return [((score - min_score) / (max_score - min_score), doc_id) 
+                   for score, doc_id in scores]
+        
+        bm25_scores_norm = normalize_scores(bm25_scores)
+        embedding_scores_norm = normalize_scores(embedding_scores)
+        
+        # 合併兩部分分數
+        combined_scores = defaultdict(float)
+        bm25_weight = 0.2
+        embedding_weight = 0.8
+        for score, doc_id in bm25_scores_norm:
+            combined_scores[doc_id] += score * bm25_weight
+        for score, doc_id in embedding_scores_norm:
+            combined_scores[doc_id] += score * embedding_weight
+        
+        # 選出前 top_k 個文檔進行 reranking
+        top_k = 5  # 可根據需求調整
+        top_k_docs = sorted(combined_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        top_k_ids = [doc_id for doc_id, _ in top_k_docs]
+        
+        # 從 corpus_dict 取出對應文檔內容
+        top_k_texts = [corpus_dict[int(doc_id)] for doc_id in top_k_ids]
+        
+        # 執行 reranking：使用 layerwise reranker 模型
+        with torch.no_grad():
+            pairs = [[query, text] for text in top_k_texts]
+            inputs = self.get_inputs(pairs, max_length=2048).to(self.device)
+            # 設定 cutoff_layers，這裡以 [28] 為例
+            outputs = self.rerank_model(**inputs, return_dict=True, cutoff_layers=[28])
+            # outputs[0] 為所有指定層的 logits，取每個輸出中最後一個 token 的分數
+            all_scores = [scores[:, -1].view(-1, ).float() for scores in outputs[0]]
+            # 由於我們只設定一個 cutoff layer，取其第一個（也是唯一一個）分數
+            rerank_scores = all_scores[0]
+            best_idx = rerank_scores.argmax().item()
+            best_source = top_k_ids[best_idx]
+            
+            return best_source
+
 # BGE檢索器
 class BGERetriever(Retriever):
     def __init__(self, model_name='BAAI/bge-m3', device='cuda'):
@@ -237,7 +422,9 @@ class BGERetriever(Retriever):
         query_embedding = self.model.encode(
             query,
             prompt="為這個句子生成表示，用以檢索相似的文章: ",
-            convert_to_tensor=True
+            convert_to_tensor=True,
+            batch_size=32,
+            max_length=1024
         )
 
         for file_id in source:
@@ -332,18 +519,49 @@ class BGERetrieverWithRerank(Retriever):
     #     '''
     #     filtered_corpus_query_pair = [corpus_dict[int(file)] for file in source]
 
+    
+# Markdown讀取器類別
+class MarkdownReader:
+    def __init__(self):
+        pass
+
+    @staticmethod
+    def read_markdown(base_path: str, file_id: int) -> str:
+        """
+        從指定路徑讀取markdown文件的內容
+        
+        Args:
+            base_path: markdown文件所在的基礎路徑
+            file_id: 文件ID
+            
+        Returns:
+            str: markdown文件的內容
+        """
+        # 構建完整的文件路徑
+        file_path = os.path.join(base_path, str(file_id), f"{file_id}.md")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except Exception as e:
+            print(f"Error reading markdown file {file_path}: {e}")
+            return ""
+
 # 主要流程類別
 class RetrieverPipeline:
-    def __init__(self, question_path, source_path, output_path):
+    def __init__(self, question_path, source_path, output_path, ground_truth_path=None, use_markdown=False):
         self.question_path = question_path
         self.source_path = source_path
         self.output_path = output_path
+        self.ground_truth_path = ground_truth_path
         self.answer_dict = {"answers": []}
         self.pdf_reader = PDFReader()
+        self.markdown_reader = MarkdownReader()
+        self.use_markdown = use_markdown  # 控制是否使用Markdown格式
         self.retrievers = {
-            'finance': HybridRAGRetriever(),
-            'insurance': HybridRAGRetriever(),
-            'faq': HybridRAGRetriever()
+            'finance': BGERetriever(),
+            'insurance': BGERetriever(),
+            'faq': BGERetriever()
         }
     
     def load_questions(self):
@@ -356,13 +574,34 @@ class RetrieverPipeline:
             return {int(key): value for key, value in key_to_source_dict.items()}
     
     def load_corpus(self, category, source_ids):
-        source_path = os.path.join(self.source_path, category)
+        """
+        載入指定類別的語料庫，支援PDF和Markdown兩種格式
+        
+        Args:
+            category: 文件類別 ('finance' 或 'insurance')
+            source_ids: 需要載入的文件ID列表
+            
+        Returns:
+            dict: 文件ID到文件內容的映射
+        """
         corpus_dict = {}
-        for file in tqdm(os.listdir(source_path), desc=f"Loading {category} corpus"):
-            file_id = int(file.replace('.pdf', ''))
-            if file_id in source_ids:
-                file_path = os.path.join(source_path, file)
-                corpus_dict[file_id] = self.pdf_reader.read_pdf(file_path)
+        
+        if self.use_markdown:
+            # 使用Markdown格式
+            converted_dir = f"{category}_converted"
+            source_path = os.path.join(self.source_path, converted_dir)
+            
+            for file_id in tqdm(source_ids, desc=f"Loading {category} corpus (Markdown)"):
+                corpus_dict[file_id] = self.markdown_reader.read_markdown(source_path, file_id)
+        else:
+            # 使用PDF格式
+            source_path = os.path.join(self.source_path, category)
+            for file in tqdm(os.listdir(source_path), desc=f"Loading {category} corpus (PDF)"):
+                file_id = int(file.replace('.pdf', ''))
+                if file_id in source_ids:
+                    file_path = os.path.join(source_path, file)
+                    corpus_dict[file_id] = self.pdf_reader.read_pdf(file_path)
+        
         return corpus_dict
     
     def get_unique_source_ids(self, qs_ref, category):
@@ -400,18 +639,51 @@ class RetrieverPipeline:
         # 輸出結果
         with open(self.output_path, 'w', encoding='utf8') as f:
             json.dump(self.answer_dict, f, ensure_ascii=False, indent=4)
+        
+        # 如果提供了ground_truth_path，則進行評估
+        if self.ground_truth_path:
+            self.evaluate()
+    
+    def evaluate(self):
+        """評估預測結果的準確率"""
+        if not self.ground_truth_path:
+            print("未提供ground_truth_path，無法進行評估")
+            return
+        
+        # 載入ground truth
+        ground_truth = load_json(self.ground_truth_path)
+        predictions = self.answer_dict
+        
+        # 計算整體Average Precision@1
+        average_precision_at_1 = evaluate_average_precision_at_1(ground_truth, predictions)
+        print(f"\n整體評估結果:")
+        print(f"Average Precision@1: {average_precision_at_1:.4f}")
+        
+        # 計算各類別的Average Precision@1
+        category_ap = calculate_category_wise_ap(ground_truth, predictions)
+        print("\n各類別評估結果:")
+        for category, ap in category_ap.items():
+            print(f"{category}: {ap:.4f}")
 
 
 def main():
     # 使用argparse解析命令列參數
     parser = argparse.ArgumentParser(description='Process some paths and files.')
-    parser.add_argument('--question_path', type=str, required=True, help='讀取發布題目路徑')  # 問題文件的路徑
-    parser.add_argument('--source_path', type=str, required=True, help='讀取參考資料路徑')  # 參考資料的路徑
-    parser.add_argument('--output_path', type=str, required=True, help='輸出符合參賽格式的答案路徑')  # 答案輸出的路徑
+    parser.add_argument('--question_path', type=str, required=True, help='讀取發布題目路徑')
+    parser.add_argument('--source_path', type=str, required=True, help='讀取參考資料路徑')
+    parser.add_argument('--output_path', type=str, required=True, help='輸出符合參賽格式的答案路徑')
+    parser.add_argument('--ground_truth_path', type=str, help='讀取ground truth路徑，用於評估結果')
+    parser.add_argument('--use_markdown', action='store_true', help='是否使用Markdown格式讀取文件（預設：False）')
 
-    args = parser.parse_args()  # 解析參數
+    args = parser.parse_args()
 
-    pipeline = RetrieverPipeline(args.question_path, args.source_path, args.output_path)
+    pipeline = RetrieverPipeline(
+        args.question_path, 
+        args.source_path, 
+        args.output_path,
+        ground_truth_path=args.ground_truth_path,
+        use_markdown=args.use_markdown
+    )
     pipeline.process()
 
 

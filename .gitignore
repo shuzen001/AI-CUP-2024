@@ -3,3 +3,17 @@ unit_test.ipynb
 demo_advanced.ipynb
 result
 2024玉山冬季賽_複賽資訊
+__pycache__/
+check_garbled.py
+check_garbled_win.py
+marker/
+md_previews.txt
+pdf2md.py
+pdf_conversion.log
+preview_md.py
+process_pdfs.sh
+setup_wsl.sh
+test.ipynb
+test_llm.py
+test_llm_win.py
+upload_fafe80789dbde70f00b9ad6df5af9ea7.png
