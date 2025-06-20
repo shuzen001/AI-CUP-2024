@@ -36,9 +36,9 @@ class RetrieverPipeline:
         self.markdown_reader = MarkdownReader()
         self.use_markdown = use_markdown  # 控制是否使用Markdown格式
         self.retrievers = {
-            'finance': HybridRAGRetriever(embed_model='altaidevorg/bge-m3-distill-8l'),
-            'insurance': HybridRAGRetriever(embed_model='altaidevorg/bge-m3-distill-8l'),
-            'faq': HybridRAGRetriever(embed_model='altaidevorg/bge-m3-distill-8l')
+            'finance': HybridRAGRetriever(embed_model='model/Qwen3-Embedding-4B'),
+            'insurance': HybridRAGRetriever(embed_model='model/Qwen3-Embedding-4B'),
+            'faq': HybridRAGRetriever(embed_model='model/Qwen3-Embedding-4B')
         }
     
     def load_pid_map(self):
