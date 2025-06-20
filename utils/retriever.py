@@ -10,6 +10,24 @@ import numpy as np
 import faiss
 
 
+# Cache for loaded SentenceTransformer models
+_MODEL_CACHE = {}
+
+
+def get_shared_model(model_name: str, device: str = 'cuda') -> SentenceTransformer:
+    """Load a SentenceTransformer model with caching."""
+    key = (model_name, device)
+    if key not in _MODEL_CACHE:
+        if model_name == 'BAAI/bge-m3':
+            model_path = 'model/BAAI__bge-m3'
+        elif model_name == 'altaidevorg/bge-m3-distill-8l':
+            model_path = 'model/altaidevorg__bge-m3-distill-8l'
+        else:
+            model_path = model_name
+        _MODEL_CACHE[key] = SentenceTransformer(model_path, device=device)
+    return _MODEL_CACHE[key]
+
+
 # embedding_model = 
 
 
@@ -401,15 +419,12 @@ class BGERetrieverWithRerank(Retriever):
 class FAISSRetriever(Retriever):
     """FAISS-based embedding retriever with optional on-disk caching."""
 
-    def __init__(self, embed_model='altaidevorg/bge-m3-distill-8l', device='cuda', index_path=None):
+    def __init__(self, embed_model='altaidevorg/bge-m3-distill-8l', device='cuda', index_path=None, model=None):
         self.device = torch.device(device)
-        if embed_model == 'BAAI/bge-m3':
-            model_path = 'model/BAAI__bge-m3'
-        elif embed_model == 'altaidevorg/bge-m3-distill-8l':
-            model_path = 'model/altaidevorg__bge-m3-distill-8l'
+        if model is not None:
+            self.embed_model = model
         else:
-            model_path = embed_model
-        self.embed_model = SentenceTransformer(model_path, device=device)
+            self.embed_model = get_shared_model(embed_model, device)
         self.index = None
         self.doc_ids = None
         self.dimension = 1024
@@ -457,3 +472,4 @@ class FAISSRetriever(Retriever):
         faiss.normalize_L2(query_embedding)
         _, indices = self.index.search(query_embedding, top_k)
         return [self.doc_ids[idx] for idx in indices[0]][0]
+

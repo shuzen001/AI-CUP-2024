@@ -19,7 +19,7 @@ from functools import partial
 
 from utils.reader import PDFReader, MarkdownReader
 from utils.eval import load_json, evaluate_average_precision_at_1, calculate_category_wise_ap
-from utils.retriever import FAISSRetriever
+from utils.retriever import FAISSRetriever, get_shared_model
 
 
 
@@ -36,12 +36,18 @@ class RetrieverPipeline:
         self.use_markdown = use_markdown  # 控制是否使用Markdown格式
         self.index_dir = os.path.join(self.source_path, 'faiss_indexes')
         os.makedirs(self.index_dir, exist_ok=True)
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        shared_model = get_shared_model('altaidevorg/bge-m3-distill-8l', device)
+
         self.retrievers = {
             'finance': FAISSRetriever(embed_model='altaidevorg/bge-m3-distill-8l',
-                                     index_path=os.path.join(self.index_dir, 'finance.index')),
+                                     index_path=os.path.join(self.index_dir, 'finance.index'),
+                                     model=shared_model),
             'insurance': FAISSRetriever(embed_model='altaidevorg/bge-m3-distill-8l',
-                                       index_path=os.path.join(self.index_dir, 'insurance.index')),
-            'faq': FAISSRetriever(embed_model='altaidevorg/bge-m3-distill-8l')
+                                       index_path=os.path.join(self.index_dir, 'insurance.index'),
+                                       model=shared_model),
+            'faq': FAISSRetriever(embed_model='altaidevorg/bge-m3-distill-8l', model=shared_model)
         }
     
     def load_pid_map(self):
