@@ -3,26 +3,71 @@ import json
 import argparse
 import numpy as np
 from tqdm import tqdm
-from collections import defaultdict
+import jieba
+from rank_bm25 import BM25Okapi
 import torch
+from sentence_transformers import SentenceTransformer
+import faiss
 import gc
-import asyncio
-import torch.quantization
 from typing import Dict, List, Tuple
 from dataclasses import dataclass
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from openai import OpenAI
-# Add concurrent.futures and partial imports after openai import
-import concurrent.futures
-from functools import partial
-
-
-from utils.reader import PDFReader, MarkdownReader
 from utils.eval import load_json, evaluate_average_precision_at_1, calculate_category_wise_ap
-from utils.retriever import HybridRAGRetriever
+from utils.reader import PDFReader
 
+# FAISS檢索器
+class FAISSRetriever:
+    def __init__(self, embed_model='altaidevorg/bge-m3-distill-8l', device='cuda'):
+        self.device = torch.device(device)
+        if embed_model == 'BAAI/bge-m3':
+            model_path = 'model/BAAI__bge-m3'
+        elif embed_model == 'altaidevorg/bge-m3-distill-8l':
+            model_path = 'model/altaidevorg__bge-m3-distill-8l'
+        else:
+            model_path = embed_model
+            
+        self.embed_model = SentenceTransformer(model_path, device=device)
+        self.index = None
+        self.doc_ids = None
+        self.dimension = 1024  # BGE模型的向量維度
 
+    def build_index(self, documents: List[str], doc_ids: List[int]):
+        """建立FAISS索引"""
+        # 將文檔轉換為向量
+        embeddings = self.embed_model.encode(
+            documents,
+            convert_to_tensor=True,
+            show_progress_bar=True,
+            batch_size=32
+        )
+        
+        # 轉換為numpy數組
+        embeddings = embeddings.cpu().numpy().astype('float32')
+        
+        # 創建FAISS索引
+        self.index = faiss.IndexFlatIP(self.dimension)  # 使用內積（餘弦相似度）
+        self.index.add(embeddings)
+        self.doc_ids = doc_ids
+
+    def search(self, query: str, top_k: int = 1) -> List[int]:
+        """使用FAISS進行檢索"""
+        # 將查詢轉換為向量
+        query_embedding = self.embed_model.encode(
+            query,
+            prompt="為這個句子生成表示，用以檢索相似的文章: ",
+            convert_to_tensor=True
+        )
+        
+        # 轉換為numpy數組並確保維度正確
+        query_embedding = query_embedding.cpu().numpy().astype('float32')
+        query_embedding = query_embedding.reshape(1, -1)  # 確保是 2D 數組
+        
+        # 使用FAISS進行檢索
+        scores, indices = self.index.search(query_embedding, top_k)
+        
+        # 返回文檔ID
+        return [self.doc_ids[idx] for idx in indices[0]]
 
 # 主要流程類別
 class RetrieverPipeline:
@@ -33,62 +78,32 @@ class RetrieverPipeline:
         self.ground_truth_path = ground_truth_path
         self.answer_dict = {"answers": []}
         self.pdf_reader = PDFReader()
-        self.markdown_reader = MarkdownReader()
-        self.use_markdown = use_markdown  # 控制是否使用Markdown格式
+        self.use_markdown = use_markdown
         self.retrievers = {
-            'finance': HybridRAGRetriever(embed_model='altaidevorg/bge-m3-distill-8l'),
-            'insurance': HybridRAGRetriever(embed_model='altaidevorg/bge-m3-distill-8l'),
-            'faq': HybridRAGRetriever(embed_model='altaidevorg/bge-m3-distill-8l')
+            'finance': FAISSRetriever(embed_model='altaidevorg/bge-m3-distill-8l'),
+            'insurance': FAISSRetriever(embed_model='altaidevorg/bge-m3-distill-8l'),
+            'faq': FAISSRetriever(embed_model='altaidevorg/bge-m3-distill-8l')
         }
     
+    def load_questions(self):
+        with open(self.question_path, 'rb') as f:
+            return json.load(f)
+    
     def load_pid_map(self):
-        with open(os.path.join(self.source_path, 'faq/pid_map_content.json'), 'r', encoding='utf-8') as f_s:
-            key_to_source_dict = json.load(f_s)  # 讀取參考資料文件
+        with open(os.path.join(self.source_path, 'faq/pid_map_content.json'), 'rb') as f_s:
+            key_to_source_dict = json.load(f_s)
             return {int(key): value for key, value in key_to_source_dict.items()}
     
     def load_corpus(self, category, source_ids):
-        """
-        載入指定類別的語料庫，支援PDF和Markdown兩種格式
-        
-        Args:
-            category: 文件類別 ('finance' 或 'insurance')
-            source_ids: 需要載入的文件ID列表
-            
-        Returns:
-            dict: 文件ID到文件內容的映射
-        """
         corpus_dict = {}
         
         if self.use_markdown:
-            # 使用Markdown格式
-            converted_dir = f"{category}_markdown"
+            converted_dir = f"{category}_converted"
             source_path = os.path.join(self.source_path, converted_dir)
-
-            missing_tasks = []
-            for file_id in source_ids:
-                md_text = self.markdown_reader.read_markdown(
-                    os.path.join(self.source_path, f"{category}_markdown"), file_id
-                )
-                if md_text == "":
-                    original_pdf = os.path.join(self.source_path, category, f"{file_id}.pdf")
-                    md_output = os.path.join(
-                        self.source_path, f"{category}_markdown", str(file_id), f"{file_id}.md"
-                    )
-                    missing_tasks.append((original_pdf, md_output))
-                else:
-                    corpus_dict[file_id] = md_text
-
-            # 先並行補轉缺失的 md
-            bulk_pdf_to_markdown(missing_tasks, max_workers=4)
-
-            # 轉檔完成後再次讀入缺失部分
-            for pdf_path, md_path in missing_tasks:
-                file_id = int(Path(pdf_path).stem)
-                corpus_dict[file_id] = self.markdown_reader.read_markdown(
-                    os.path.join(self.source_path, f"{category}_markdown"), file_id
-                )
+            
+            for file_id in tqdm(source_ids, desc=f"Loading {category} corpus (Markdown)"):
+                corpus_dict[file_id] = self.markdown_reader.read_markdown(source_path, file_id)
         else:
-            # 使用PDF格式
             source_path = os.path.join(self.source_path, category)
             for file in tqdm(os.listdir(source_path), desc=f"Loading {category} corpus (PDF)"):
                 file_id = int(file.replace('.pdf', ''))
@@ -106,27 +121,31 @@ class RetrieverPipeline:
         return sorted(source_ids)
     
     def process(self):
-        qs_ref = load_json(self.question_path)
+        qs_ref = self.load_questions()
         key_to_source_dict = self.load_pid_map()
 
-        # 載入不同類別的corpus
+        # 載入不同類別的corpus並建立FAISS索引
         corpus = {}
         for category in ['finance', 'insurance']:
             source_ids = self.get_unique_source_ids(qs_ref, category)
             corpus[category] = self.load_corpus(category, source_ids)
+            
+            # 建立FAISS索引
+            documents = [corpus[category][doc_id] for doc_id in source_ids]
+            self.retrievers[category].build_index(documents, source_ids)
         
         # 處理每個問題
         for q_dict in tqdm(qs_ref['questions'], desc='Processing questions'):
             category = q_dict['category']
             retriever = self.retrievers[category]
-            if retriever:
-                if category == 'faq':
-                    corpus_faq = {key: str(value) for key, value in key_to_source_dict.items() if key in q_dict['source']}
-                    retrieved = retriever.retrieve(q_dict['query'], q_dict['source'], corpus_faq)
-                else:
-                    retrieved = retriever.retrieve(q_dict['query'], q_dict['source'], corpus[category])
+            
+            if category == 'faq':
+                corpus_faq = {key: str(value) for key, value in key_to_source_dict.items() if key in q_dict['source']}
+                documents = [corpus_faq[doc_id] for doc_id in q_dict['source']]
+                retriever.build_index(documents, q_dict['source'])
+                retrieved = retriever.search(q_dict['query'])[0]
             else:
-                raise ValueError("Invalid category")
+                retrieved = retriever.search(q_dict['query'])[0]
             
             self.answer_dict['answers'].append({"qid": q_dict['qid'], "retrieve": retrieved})
         
@@ -139,31 +158,23 @@ class RetrieverPipeline:
             self.evaluate()
     
     def evaluate(self):
-        """評估預測結果的準確率"""
         if not self.ground_truth_path:
             print("未提供ground_truth_path，無法進行評估")
             return
         
-        # 載入ground truth
         ground_truth = load_json(self.ground_truth_path)
         predictions = self.answer_dict
         
-        # 計算整體Average Precision@1
         average_precision_at_1 = evaluate_average_precision_at_1(ground_truth, predictions)
         print(f"\n整體評估結果:")
         print(f"Average Precision@1: {average_precision_at_1:.4f}")
         
-        # 計算各類別的Average Precision@1
         category_ap = calculate_category_wise_ap(ground_truth, predictions)
         print("\n各類別評估結果:")
         for category, ap in category_ap.items():
             print(f"{category}: {ap:.4f}")
 
-
-
-
 def main():
-    # 使用argparse解析命令列參數
     parser = argparse.ArgumentParser(description='Process some paths and files.')
     parser.add_argument('--question_path', type=str, required=True, help='讀取發布題目路徑')
     parser.add_argument('--source_path', type=str, required=True, help='讀取參考資料路徑')
@@ -183,4 +194,4 @@ def main():
     pipeline.process()
 
 if __name__ == "__main__":
-    main()
+    main() 

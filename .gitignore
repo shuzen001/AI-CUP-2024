@@ -17,3 +17,9 @@ test.ipynb
 test_llm.py
 test_llm_win.py
 upload_fafe80789dbde70f00b9ad6df5af9ea7.png
+Dolphin/
+data/
+docling.ipynb
+file/
+model/
+multimodal_rag_using_document_retrieval_and_vlms.ipynb
