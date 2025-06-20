@@ -1,7 +1,6 @@
 import os
 import json
 import argparse
-import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
 import torch
@@ -20,7 +19,7 @@ from functools import partial
 
 from utils.reader import PDFReader, MarkdownReader
 from utils.eval import load_json, evaluate_average_precision_at_1, calculate_category_wise_ap
-from utils.retriever import HybridRAGRetriever
+from utils.retriever import FAISSRetriever
 
 
 
@@ -35,10 +34,14 @@ class RetrieverPipeline:
         self.pdf_reader = PDFReader()
         self.markdown_reader = MarkdownReader()
         self.use_markdown = use_markdown  # 控制是否使用Markdown格式
+        self.index_dir = os.path.join(self.source_path, 'faiss_indexes')
+        os.makedirs(self.index_dir, exist_ok=True)
         self.retrievers = {
-            'finance': HybridRAGRetriever(embed_model='model/Qwen3-Embedding-4B'),
-            'insurance': HybridRAGRetriever(embed_model='model/Qwen3-Embedding-4B'),
-            'faq': HybridRAGRetriever(embed_model='model/Qwen3-Embedding-4B')
+            'finance': FAISSRetriever(embed_model='model/Qwen3-Embedding-4B',
+                                     index_path=os.path.join(self.index_dir, 'finance.index')),
+            'insurance': FAISSRetriever(embed_model='model/Qwen3-Embedding-4B',
+                                       index_path=os.path.join(self.index_dir, 'insurance.index')),
+            'faq': FAISSRetriever(embed_model='model/Qwen3-Embedding-4B')
         }
     
     def load_pid_map(self):
@@ -109,11 +112,17 @@ class RetrieverPipeline:
         qs_ref = load_json(self.question_path)
         key_to_source_dict = self.load_pid_map()
 
-        # 載入不同類別的corpus
+        # 載入不同類別的corpus並建立索引
         corpus = {}
         for category in ['finance', 'insurance']:
             source_ids = self.get_unique_source_ids(qs_ref, category)
             corpus[category] = self.load_corpus(category, source_ids)
+            index_file = self.retrievers[category].index_path
+            if index_file and os.path.exists(index_file):
+                self.retrievers[category].load_index(index_file)
+            else:
+                documents = [corpus[category][doc_id] for doc_id in source_ids]
+                self.retrievers[category].build_index(documents, source_ids, save_path=index_file)
         
         # 處理每個問題
         for q_dict in tqdm(qs_ref['questions'], desc='Processing questions'):
@@ -122,6 +131,8 @@ class RetrieverPipeline:
             if retriever:
                 if category == 'faq':
                     corpus_faq = {key: str(value) for key, value in key_to_source_dict.items() if key in q_dict['source']}
+                    documents = [corpus_faq[doc_id] for doc_id in q_dict['source']]
+                    retriever.build_index(documents, q_dict['source'])
                     retrieved = retriever.retrieve(q_dict['query'], q_dict['source'], corpus_faq)
                 else:
                     retrieved = retriever.retrieve(q_dict['query'], q_dict['source'], corpus[category])
