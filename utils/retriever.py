@@ -5,6 +5,9 @@ from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForSequenceClassification
 from langchain.text_splitter import CharacterTextSplitter
 from collections import defaultdict
+import os
+import numpy as np
+import faiss
 
 
 # embedding_model = 
@@ -393,3 +396,64 @@ class BGERetrieverWithRerank(Retriever):
             best_idx = rerank_scores.argmax().item()
             best_source = top_k_sources[best_idx]
             return best_source
+
+
+class FAISSRetriever(Retriever):
+    """FAISS-based embedding retriever with optional on-disk caching."""
+
+    def __init__(self, embed_model='altaidevorg/bge-m3-distill-8l', device='cuda', index_path=None):
+        self.device = torch.device(device)
+        if embed_model == 'BAAI/bge-m3':
+            model_path = 'model/BAAI__bge-m3'
+        elif embed_model == 'altaidevorg/bge-m3-distill-8l':
+            model_path = 'model/altaidevorg__bge-m3-distill-8l'
+        else:
+            model_path = embed_model
+        self.embed_model = SentenceTransformer(model_path, device=device)
+        self.index = None
+        self.doc_ids = None
+        self.dimension = 1024
+        self.index_path = index_path
+
+    def load_index(self, index_file):
+        self.index = faiss.read_index(index_file)
+        ids_path = index_file + '_ids.npy'
+        if os.path.exists(ids_path):
+            self.doc_ids = np.load(ids_path).tolist()
+
+    def save_index(self, index_file):
+        faiss.write_index(self.index, index_file)
+        np.save(index_file + '_ids.npy', np.array(self.doc_ids))
+
+    def build_index(self, documents, doc_ids, save_path=None):
+        embeddings = self.embed_model.encode(
+            documents,
+            convert_to_tensor=True,
+            show_progress_bar=False,
+            batch_size=32,
+            normalize_embeddings=True,
+        )
+        embeddings = embeddings.cpu().numpy().astype('float32')
+        faiss.normalize_L2(embeddings)
+        self.index = faiss.IndexHNSWFlat(self.dimension, 32)
+        self.index.hnsw.efConstruction = 200
+        self.index.add(embeddings)
+        self.doc_ids = list(doc_ids)
+        if save_path:
+            self.save_index(save_path)
+
+    def retrieve(self, query, source, corpus_dict, top_k=1):
+        if self.index is None:
+            docs = [corpus_dict[int(doc_id)] for doc_id in source]
+            self.build_index(docs, source, save_path=self.index_path)
+
+        query_embedding = self.embed_model.encode(
+            query,
+            prompt="為這個句子生成表示，用以檢索相似的文章: ",
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+        )
+        query_embedding = query_embedding.cpu().numpy().astype('float32').reshape(1, -1)
+        faiss.normalize_L2(query_embedding)
+        _, indices = self.index.search(query_embedding, top_k)
+        return [self.doc_ids[idx] for idx in indices[0]][0]
