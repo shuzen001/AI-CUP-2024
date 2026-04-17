@@ -15,6 +15,7 @@ from openai import OpenAI
 # Add concurrent.futures and partial imports after openai import
 import concurrent.futures
 from functools import partial
+from sentence_transformers import SentenceTransformer
 
 
 from utils.reader import PDFReader, MarkdownReader
@@ -36,12 +37,19 @@ class RetrieverPipeline:
         self.use_markdown = use_markdown  # 控制是否使用Markdown格式
         self.index_dir = os.path.join(self.source_path, 'faiss_indexes')
         os.makedirs(self.index_dir, exist_ok=True)
+        
+        # 只載入一次嵌入模型，三個 retriever 共享使用
+        print("載入嵌入模型...")
+        self.shared_embed_model = SentenceTransformer('model/Qwen3-Embedding-4B', device='cuda')
+        print("嵌入模型載入完成！")
+        
+        # 建立 retrievers，但傳入已載入的模型實例
         self.retrievers = {
-            'finance': FAISSRetriever(embed_model='model/Qwen3-Embedding-4B',
+            'finance': FAISSRetriever(embed_model=self.shared_embed_model,
                                      index_path=os.path.join(self.index_dir, 'finance.index')),
-            'insurance': FAISSRetriever(embed_model='model/Qwen3-Embedding-4B',
+            'insurance': FAISSRetriever(embed_model=self.shared_embed_model,
                                        index_path=os.path.join(self.index_dir, 'insurance.index')),
-            'faq': FAISSRetriever(embed_model='model/Qwen3-Embedding-4B')
+            'faq': FAISSRetriever(embed_model=self.shared_embed_model)
         }
     
     def load_pid_map(self):
@@ -119,10 +127,13 @@ class RetrieverPipeline:
             corpus[category] = self.load_corpus(category, source_ids)
             index_file = self.retrievers[category].index_path
             if index_file and os.path.exists(index_file):
+                print(f"載入已存在的 {category} 索引...")
                 self.retrievers[category].load_index(index_file)
             else:
+                print(f"建立 {category} 類別的新索引...")
                 documents = [corpus[category][doc_id] for doc_id in source_ids]
-                self.retrievers[category].build_index(documents, source_ids, save_path=index_file)
+                # 使用較小的批次大小來節省記憶體
+                self.retrievers[category].build_index(documents, source_ids, save_path=index_file, batch_size=8)
         
         # 處理每個問題
         for q_dict in tqdm(qs_ref['questions'], desc='Processing questions'):

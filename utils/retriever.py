@@ -8,6 +8,8 @@ from collections import defaultdict
 import os
 import numpy as np
 import faiss
+import gc
+from tqdm import tqdm
 
 
 # embedding_model = 
@@ -403,13 +405,21 @@ class FAISSRetriever(Retriever):
 
     def __init__(self, embed_model='altaidevorg/bge-m3-distill-8l', device='cuda', index_path=None):
         self.device = torch.device(device)
-        if embed_model == 'BAAI/bge-m3':
-            model_path = 'model/BAAI__bge-m3'
-        elif embed_model == 'altaidevorg/bge-m3-distill-8l':
-            model_path = 'model/altaidevorg__bge-m3-distill-8l'
-        else:
-            model_path = embed_model
-        self.embed_model = SentenceTransformer(model_path, device=device)
+        
+        # 檢查 embed_model 是否為已載入的模型實例
+        if hasattr(embed_model, 'encode'):  # 如果是 SentenceTransformer 實例
+            print("使用共享的嵌入模型實例")
+            self.embed_model = embed_model
+        else:  # 如果是字串路徑，則載入模型
+            if embed_model == 'BAAI/bge-m3':
+                model_path = 'model/BAAI__bge-m3'
+            elif embed_model == 'altaidevorg/bge-m3-distill-8l':
+                model_path = 'model/altaidevorg__bge-m3-distill-8l'
+            else:
+                model_path = embed_model
+            print(f"載入嵌入模型: {model_path}")
+            self.embed_model = SentenceTransformer(model_path, device=device)
+        
         self.index = None
         self.doc_ids = None
         self.dimension = 1024
@@ -425,22 +435,55 @@ class FAISSRetriever(Retriever):
         faiss.write_index(self.index, index_file)
         np.save(index_file + '_ids.npy', np.array(self.doc_ids))
 
-    def build_index(self, documents, doc_ids, save_path=None):
-        embeddings = self.embed_model.encode(
-            documents,
-            convert_to_tensor=True,
-            show_progress_bar=False,
-            batch_size=32,
-            normalize_embeddings=True,
-        )
-        embeddings = embeddings.cpu().numpy().astype('float32')
+    def build_index(self, documents, doc_ids, save_path=None, batch_size=16):
+        """建立 FAISS 索引，使用批次處理來節省記憶體"""
+        print(f"正在建立 FAISS 索引，共 {len(documents)} 個文檔...")
+        
+        # 清除 GPU 記憶體
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        all_embeddings = []
+        
+        # 分批處理文檔以節省記憶體
+        for i in tqdm(range(0, len(documents), batch_size), desc="建立文檔嵌入"):
+            batch_docs = documents[i:i + batch_size]
+            
+            # 為每個批次生成嵌入
+            with torch.no_grad():
+                batch_embeddings = self.embed_model.encode(
+                    batch_docs,
+                    convert_to_tensor=True,
+                    show_progress_bar=False,
+                    batch_size=8,  # 進一步降低批次大小
+                    normalize_embeddings=True,
+                )
+                # 立即轉移到 CPU 以釋放 GPU 記憶體
+                batch_embeddings = batch_embeddings.cpu().numpy().astype('float32')
+                all_embeddings.append(batch_embeddings)
+                
+                # 清除 GPU 記憶體
+                del batch_embeddings
+                torch.cuda.empty_cache()
+        
+        # 合併所有嵌入
+        embeddings = np.vstack(all_embeddings)
+        del all_embeddings
+        gc.collect()
+        
+        # 正規化嵌入
         faiss.normalize_L2(embeddings)
+        
+        # 建立 FAISS 索引
         self.index = faiss.IndexHNSWFlat(self.dimension, 32)
         self.index.hnsw.efConstruction = 200
         self.index.add(embeddings)
         self.doc_ids = list(doc_ids)
+        
         if save_path:
             self.save_index(save_path)
+            
+        print(f"FAISS 索引建立完成，包含 {self.index.ntotal} 個向量")
 
     def retrieve(self, query, source, corpus_dict, top_k=1):
         if self.index is None:
