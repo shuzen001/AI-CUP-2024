@@ -26,11 +26,3 @@ python main.py --question_path "競賽資料集/dataset/preliminary/questions_ex
 | **HybridRAGRetriever-E5**             | 0.8067      | 0.9200    | 0.5600    | 0.9400    | 在保險和常見問題類別表現優異，但金融類別仍有改進空間。                            |
 | **Hybrid Retrieval - BGE/M3**         | **0.8667**  | 0.9000    | 0.7400    | 0.9600    | 結合多種檢索策略的方法，在所有類別都達到了不錯的平衡，特別是在金融類別有明顯提升。                            |
 
-
-## 待辦
-- 用將pdf內容做分段，以方便檢索，否則模型的context size 不夠大，檢索準確度就會下降，就像是bert一樣
-- 可以嘗試使用多模態的模型去分析pdf，OCR之類的方法
-- 可以嘗試fine-tune model
-- 可以嘗試做batch，使embedding 過程更快
-- 可以嘗試做chunk
--
